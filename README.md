@@ -46,6 +46,7 @@ The first 80 bytes are reserved for the following properties, so you don’t hav
 * float **transform.eulerAngles.x** [4 bytes, indicates the last x-component of the entity euler rotation]
 * float **transform.eulerAngles.y** [4 bytes, indicates the last x-component of the entity euler rotation]
 * float **transform.eulerAngles.z** [4 bytes, indicates the last x-component of the entity euler rotation]
+* char[] **rcIdentifier** [32 bytes, the Remote Controller identifier of the entity]
 
 The remaining 176 bytes are free to store anything else you might want to keep track of. The example plugin included shows exactly how that can be achieved easily.
 
