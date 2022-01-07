@@ -20,6 +20,7 @@ NOTE: This plugin utilises Reflection in 1 or 2 places in order to force the Bas
 * When a custom Drone is deployed back from an Item, and it’s tied to existing Drone data, the Drone loads the arbitrary data back and it assumes the owner ID of the player that has just deployed it
 * When a custom Drone Item is removed from the world, and that Item was tied to existing Drone data, that existing Drone data is permanently removed (except when the Item dies right after deploying the Drone from it - in that case, the data persists)
 * Likewise, if a Drone is killed (and it’s not happening on plugin unload), its data is also permanently removed from the datafile. On plugin unload, the data is saved instead
+* Disabling Update and FixedUpdate to save on resoruces. Instead, the FixedUpdate logic replacement is done consecutively for all custom Drones from 1 single Mono behaviour. Foregoing individual updates can massively improve performance, meaning hundreds of agents at the same time, potentially.
 
 ## Stored permadata (oxide/data/CustomDrones.PERMADATA.json)
 
