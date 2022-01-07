@@ -4,18 +4,23 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Text.RegularExpressions;
 using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("Custom Drones", "Nikedemos", "0.6.9")]
+    [Info("Custom Drones", "Nikedemos", "0.7.5")]
     [Description("Provides the base for handling extended Drone functionality")]
     public class CustomDrones : RustPlugin
     {
         #region CONST/STATIC
         public const string PREFAB_DRONE_DEPLOYED = "assets/prefabs/deployable/drone/drone.deployed.prefab";
         public const string PREFAB_MANDATORY_PREFIX = "assets/custom_drones/";
+        public static Item.Flag FLAG_WAS_JUST_DEPLOYED = global::Item.Flag.Cooking;
+
+        public const int HEADER_SIZE_BYTES = 80;
+
         #endregion
         #region TOP LEVEL DECLARATIONS
         public static bool Loading = true;
@@ -27,7 +32,7 @@ namespace Oxide.Plugins
         public PermaData StoredPermaData;
 
         public static GameObject SimulationGO;
-        public static Simulation SimulationMono;
+        public static SimulationUpdater SimulationMono;
 
         #endregion
         #region HOOK METHODS
@@ -45,7 +50,7 @@ namespace Oxide.Plugins
             Instance = this;
             lang.RegisterMessages(LangMessages, this);
 
-            DroneCustomBasic.AllCustomDrones = new ListHashSet<DroneCustomBasic>();
+            SimulationUpdater.AllCustomDrones = new ListHashSet<DroneCustomBasic>();
 
             PreProcessedServer = new PreProcessedManager();
 
@@ -54,31 +59,155 @@ namespace Oxide.Plugins
             Unloading = false;
 
             LoadMetaData();
+            LoadPermaData();
 
             OnServerInitializedIntegrityCheck();
         }
+
+        private void OnEntityKill(DroneCustomBasic drone)
+        {
+            if (IsObjectNull(Instance))
+            {
+                return;
+            }
+
+            drone.OnEntityKill();
+        }
+
+        object OnItemRemove(Item item)
+        {
+            if (IsObjectNull(Instance))
+            {
+                return null;
+            }
+
+            //ignore freshly built
+            if (item.HasFlag(FLAG_WAS_JUST_DEPLOYED))
+            {
+                return null;
+            }
+
+            if (!PreProcessedServer.SkinIDToPrefabName.ContainsKey(item.skin))
+            {
+                return null;
+            }
+
+            if (IsObjectNull(item.instanceData))
+            {
+                return null;
+            }
+
+            if (!StoredPermaData.DroneData.ContainsKey(item.instanceData.dataInt))
+            {
+               return null;
+            }
+
+            StoredPermaData.DroneData.Remove(item.instanceData.dataInt);
+            StoredPermaData.Dirty = true;
+
+            return null;
+        }
+
+        void OnEntityBuilt(Planner planner, GameObject gObject)
+        {
+            if (!PreProcessedServer.SkinIDToPrefabName.ContainsKey(planner.skinID))
+            {
+                return;
+            }
+
+            var ownerItem = planner.GetItem();
+
+            if (IsObjectNull(ownerItem))
+            {
+                return;
+            }
+
+            //IMPORTANT: immediately mark the item with an arbitrary flag, so it doesn't trigger
+            //data removal!
+
+            ownerItem.SetFlag(FLAG_WAS_JUST_DEPLOYED, true);
+
+            Drone vanillaDroneToReplace = gObject.GetComponent<Drone>();
+
+            if (IsObjectNull(vanillaDroneToReplace))
+            {
+                return;
+            }
+
+            var ownerID = vanillaDroneToReplace.OwnerID;
+            var pos = vanillaDroneToReplace.transform.position;
+            var rot = vanillaDroneToReplace.transform.eulerAngles;
+            var skinID = vanillaDroneToReplace.skinID;
+
+            vanillaDroneToReplace.limitNetworking = true;
+            vanillaDroneToReplace.OnNetworkSubscribersLeave(Network.Net.sv.connections);
+
+            vanillaDroneToReplace.Invoke(() => vanillaDroneToReplace.Kill(), 0.1F);
+
+            int dataInt = -1;
+
+            if (!IsObjectNull(ownerItem.instanceData))
+            {
+                dataInt = ownerItem.instanceData.dataInt;
+            }
+
+            DroneCustomBasic baseEntity = null;
+
+            if (Instance.StoredPermaData.DroneData.ContainsKey(dataInt))
+            {
+                //check for collision!
+                //there might be a case where you have just deployed a drone
+                //and there already exists a drone with that data entry id.
+                //in this case...
+
+                bool collisionDetected = false;
+
+                for (var i = 0; i < SimulationUpdater.AllCustomDrones.Count; i++)
+                {
+                    if (SimulationUpdater.AllCustomDrones[i].DroneDataBuffer.EntryID == dataInt)
+                    {
+                        collisionDetected = true;
+                        break;
+                    }
+                }
+
+                baseEntity = SummonWithData(dataInt, pos, rot, skinID, collisionDetected);
+            }
+            else
+            {
+                baseEntity = GameManager.server.CreateEntity(PreProcessedServer.SkinIDToPrefabName[skinID], pos, Quaternion.Euler(rot)) as DroneCustomBasic;
+                if (!baseEntity)
+                {
+                    Debug.LogWarning("Couldn't create prefab:" + PreProcessedServer.SkinIDToPrefabName[skinID]);
+                    return;
+                }
+            }
+
+            baseEntity.Spawn();
+
+        }
+
         private void Unload()
         {
             Unloading = true;
             StoredMetaData.Dirty = true;
+            StoredPermaData.Dirty = true;
 
             OnServerSave();
 
             PreProcessedServer.Cleanup();
-
-
 
             if (!IsObjectNull(SimulationGO))
             {
                 UnityEngine.Object.DestroyImmediate(SimulationGO);
             }
 
-            foreach (var drone in BaseNetworkable.serverEntities.OfType<DroneCustomBasic>())
+            foreach (var drone in BaseNetworkable.serverEntities.OfType<DroneCustomBasic>().ToArray())
             {
                 drone.Kill();
             }
 
-            DroneCustomBasic.AllCustomDrones = null;
+            SimulationUpdater.AllCustomDrones = null;
 
             Unloading = false;
             Instance = null;
@@ -122,9 +251,9 @@ namespace Oxide.Plugins
         public const string MSG_PREFAB_ALREADY_EXISTS = nameof(MSG_PREFAB_ALREADY_EXISTS);
         public const string MSG_DRONE_PREFAB_REGISTERED_SUCCESFULLY = nameof(MSG_DRONE_PREFAB_REGISTERED_SUCCESFULLY);
         public const string MSG_PREFAB_NAME_INCORRECT = nameof(MSG_PREFAB_NAME_INCORRECT);
-        public const string MSG_PLACEHOLDER_14 = nameof(MSG_PLACEHOLDER_14);
-        public const string MSG_PLACEHOLDER_15 = nameof(MSG_PLACEHOLDER_15);
-        public const string MSG_PLACEHOLDER_16 = nameof(MSG_PLACEHOLDER_16);
+        public const string MSG_SKINID_ALREADY_EXISTS = nameof(MSG_SKINID_ALREADY_EXISTS);
+        public const string MSG_ERROR_DESERIALIZING_PREFAB_NOT_FOUND = nameof(MSG_ERROR_DESERIALIZING_PREFAB_NOT_FOUND);
+        public const string MSG_ERROR_DESERIALIZING_ENTITY_NULL = nameof(MSG_ERROR_DESERIALIZING_ENTITY_NULL);
         public const string MSG_PLACEHOLDER_17 = nameof(MSG_PLACEHOLDER_17);
         public const string MSG_PLACEHOLDER_18 = nameof(MSG_PLACEHOLDER_18);
         public const string MSG_PLACEHOLDER_19 = nameof(MSG_PLACEHOLDER_19);
@@ -137,10 +266,10 @@ namespace Oxide.Plugins
             [MSG_METADATA_NULL] = "Null meta data, generating default.",
             [MSG_METADATA_SAVING] = "Saving meta data...",
 
-            [MSG_METADATA_LOADING] = "Loading perma data...",
-            [MSG_METADATA_CORRUPT] = "Corrupt perma data, generating default.",
-            [MSG_METADATA_NULL] = "Null perma data, generating default.",
-            [MSG_METADATA_SAVING] = "Saving perma data...",
+            [MSG_PERMADATA_LOADING] = "Loading perma data...",
+            [MSG_PERMADATA_CORRUPT] = "Corrupt perma data, generating default.",
+            [MSG_PERMADATA_NULL] = "Null perma data, generating default.",
+            [MSG_PERMADATA_SAVING] = "Saving perma data...",
 
             [MSG_ANALYSING_INTEGRITY] = "Analysing plugin bundle integrity...",
             [MSG_FOUND_REFERENCED_PLUGIN] = "Found referenced plugin: {0} by {1}",
@@ -152,9 +281,9 @@ namespace Oxide.Plugins
             [MSG_PREFAB_ALREADY_EXISTS] = "ERROR: Trying to register prefab {0}, but it already exists!",
             [MSG_DRONE_PREFAB_REGISTERED_SUCCESFULLY] = "Registered {0} as a custom type {1}",
             [MSG_PREFAB_NAME_INCORRECT] = "WARNING: Trying to register prefab {0}, but the format of the prefab path provided is not valid. The prefab is going to be registered as {1}",
-            [MSG_PLACEHOLDER_14] = "PLACEHOLDER 14",
-            [MSG_PLACEHOLDER_15] = "PLACEHOLDER 15",
-            [MSG_PLACEHOLDER_16] = "PLACEHOLDER 16",
+            [MSG_SKINID_ALREADY_EXISTS] = "ERROR: Trying to register skin ID {0}, but it already exists!",
+            [MSG_ERROR_DESERIALIZING_PREFAB_NOT_FOUND] = "ERROR: Could not deserialize the drone data. No prefab entry for {0}",
+            [MSG_ERROR_DESERIALIZING_ENTITY_NULL] = "ERROR: Could not deserialize the drone data. Resulting entity is null.",
             [MSG_PLACEHOLDER_17] = "PLACEHOLDER 17",
             [MSG_PLACEHOLDER_18] = "PLACEHOLDER 18",
             [MSG_PLACEHOLDER_19] = "PLACEHOLDER 19",
@@ -191,13 +320,18 @@ namespace Oxide.Plugins
             private SoundDefinition _droneMovLoopStartSoundDef;
             private SoundDefinition _droneMovLoopStopSoundDef;
 
+            private BaseCombatEntity.Pickup _dronePickup;
+
+            public Hash<ulong, string> SkinIDToPrefabName = new Hash<ulong, string>();
+            public Hash<string, ulong> PrefabNameToSkinID = new Hash<string, ulong>();
+
             private ProtectionProperties _customDroneProtectionProperties;
 
-            private DirectionProperties[] _dronePrefabDirectionProperties;
+            //private DirectionProperties[] _dronePrefabDirectionProperties;
 
             private Hash<string, GameObject> _dronePrefabs = new Hash<string, GameObject>();
 
-            private PrefabAttribute.AttributeCollection _dronePrefabAttributeCollection;
+            //private PrefabAttribute.AttributeCollection _dronePrefabAttributeCollection;
 
             private float[] _droneProtectionAmounts = new float[25]
             {
@@ -239,6 +373,7 @@ namespace Oxide.Plugins
                 _droneImpactEffect = originalEntity.impactEffect;
                 _droneLeanWeight = originalEntity.leanWeight;
                 _droneBounds = originalEntity.bounds;
+                _dronePickup = originalEntity.pickup;
 
                 _droneEntitylessPrefab.name = originalPrefab.name;
 
@@ -247,9 +382,9 @@ namespace Oxide.Plugins
                 _droneMovLoopStartSoundDef = originalEntity.movementStartSoundDef;
                 _droneMovLoopStopSoundDef = originalEntity.movementStopSoundDef;
 
-                _dronePrefabDirectionProperties = PrefabAttribute.server.FindAll<DirectionProperties>(_dronePrefabID);
+                //_dronePrefabDirectionProperties = PrefabAttribute.server.FindAll<DirectionProperties>(_dronePrefabID);
 
-                _dronePrefabAttributeCollection = PrefabAttribute.server.prefabs[_dronePrefabID];
+                //_dronePrefabAttributeCollection = PrefabAttribute.server.prefabs[_dronePrefabID];
 
                 UnityEngine.Object.DestroyImmediate(originalEntity);
 
@@ -280,7 +415,7 @@ namespace Oxide.Plugins
                 return fullCustomPrefabName.ToLower();
             }
 
-            public GameObject RegisterDronePrefab<T>(string fullCustomPrefabName) where T: DroneCustomBasic
+            public GameObject RegisterDronePrefab<T>(string fullCustomPrefabName, ulong associatedSkinID) where T: DroneCustomBasic
             {
                 var sanitized = SanitizedPrefabName(fullCustomPrefabName);
 
@@ -296,6 +431,12 @@ namespace Oxide.Plugins
                     return null;
                 }
 
+                if (SkinIDToPrefabName.ContainsKey(associatedSkinID))
+                {
+                    Instance.PrintError(MSG(MSG_SKINID_ALREADY_EXISTS, null, associatedSkinID));
+                    return null;
+                }
+
                 var newGameObject = Facepunch.Instantiate.GameObject(_droneEntitylessPrefab);
                 newGameObject.name = _droneEntitylessPrefab.name;
 
@@ -303,7 +444,11 @@ namespace Oxide.Plugins
 
                 modifiedDrone.body = newGameObject.GetComponent<Rigidbody>();
                 modifiedDrone.currentInput = new Drone.DroneInputState();
-                //modifiedDrone.prefabID = DronePrefabID;
+
+                //keep the original prefab ID intact
+                modifiedDrone.prefabID = _dronePrefabID;
+
+                modifiedDrone.pickup = _dronePickup;
 
                 modifiedDrone.IDPanelPrefab = _droneIdPanelPrefab;
                 modifiedDrone.impactEffect = _droneImpactEffect;
@@ -338,9 +483,13 @@ namespace Oxide.Plugins
 
                 modifiedDrone.baseProtection = _customDroneProtectionProperties;
 
-
-                var prefabID = fullCustomPrefabName.ManifestHash();
+                var fakePrefabID = fullCustomPrefabName.ManifestHash();
                 StringPool.Add(fullCustomPrefabName);
+
+                SkinIDToPrefabName.Add(associatedSkinID, fullCustomPrefabName);
+                PrefabNameToSkinID.Add(fullCustomPrefabName, associatedSkinID);
+
+                modifiedDrone.skinID = associatedSkinID;
 
                 //get the current manifest...
 
@@ -362,11 +511,10 @@ namespace Oxide.Plugins
                 _dronePrefabs.Add(fullCustomPrefabName, newGameObject);
                 GameManager.server.preProcessed.AddPrefab(fullCustomPrefabName, newGameObject);
 
-                PrefabAttribute.server.prefabs.Add(prefabID, _dronePrefabAttributeCollection);
-
-                modifiedDrone.prefabID = prefabID;
+                //PrefabAttribute.server.prefabs.Add(fakePrefabID, _dronePrefabAttributeCollection);
 
                 modifiedDrone.enableSaving = false;
+                modifiedDrone.FakePrefabID = fakePrefabID;
 
                 Instance.PrintWarning(MSG(MSG_DRONE_PREFAB_REGISTERED_SUCCESFULLY, null, modifiedDrone.PrefabName, modifiedDrone.GetType()));
 
@@ -383,12 +531,22 @@ namespace Oxide.Plugins
                     return false;
                 }
 
-                var prefabID = fullCustomPrefabName.ManifestHash();
+                if (!PrefabNameToSkinID.ContainsKey(fullCustomPrefabName))
+                {
+                    return false;
+                }
+
+                ulong associatedSkinID = PrefabNameToSkinID[fullCustomPrefabName];
+
+                var fakePrefabID = fullCustomPrefabName.ManifestHash();
 
                 StringPool.toNumber.Remove(fullCustomPrefabName);
-                StringPool.toString.Remove(prefabID);
+                StringPool.toString.Remove(fakePrefabID);
 
-                PrefabAttribute.server.prefabs.Remove(prefabID);
+                SkinIDToPrefabName.Remove(associatedSkinID);
+                PrefabNameToSkinID.Remove(fullCustomPrefabName);
+
+                PrefabAttribute.server.prefabs.Remove(fakePrefabID);
 
                 _dronePrefabs.Remove(fullCustomPrefabName);
                 GameManager.server.preProcessed.Invalidate(fullCustomPrefabName);
@@ -410,10 +568,10 @@ namespace Oxide.Plugins
             }
         }
         #endregion
-
         #region SIMULATION
-        public class Simulation : MonoBehaviour
+        public class SimulationUpdater : MonoBehaviour
         {
+            public static ListHashSet<DroneCustomBasic> AllCustomDrones;
             public bool Playing = true;
 
             void FixedUpdate()
@@ -423,21 +581,18 @@ namespace Oxide.Plugins
                     return;
                 }
 
-                for (var d = 0; d < DroneCustomBasic.AllCustomDrones.Count; d++)
+                for (var d = 0; d < AllCustomDrones.Count; d++)
                 {
-                    DroneCustomBasic.AllCustomDrones[d].OnFixedUpdate();
+                    AllCustomDrones[d].OnFixedUpdate();
                 }
             }
 
         }
         #endregion
-
-        #region CUSTOM DRONE STUFF
+        #region CUSTOM DRONE MONO CLASS
 
         public class DroneCustomBasic : Drone
         {
-            public static ListHashSet<DroneCustomBasic> AllCustomDrones;
-
             public Vector3 SpawnPosition;
             public Vector3 SpawnRotation;
 
@@ -450,7 +605,27 @@ namespace Oxide.Plugins
 
             public float BrainUpdateRateCurrent;
 
-            public CustomDroneData DroneData;
+            public DroneBuffer DroneDataBuffer = null;
+
+            public string CorpsePrefab = null;
+
+            public uint FakePrefabID;
+
+            private bool _wasJustPickedUp = false;
+
+            public void SummonedFromData(DroneBuffer dataEntry)
+            {
+                DroneDataBuffer = dataEntry;
+
+                using (var stream = new MemoryStream(DroneDataBuffer.RawData))
+                {
+                    using (var reader = new BinaryReader(stream))
+                    {
+                        stream.Position = HEADER_SIZE_BYTES; 
+                        OnLoadExtra(stream, reader);
+                    }
+                }
+            }
 
             public override void ServerInit()
             {
@@ -461,16 +636,69 @@ namespace Oxide.Plugins
 
                 RandomizeBrainUpdateRate();
 
-                AllCustomDrones.Add(this);
+                SimulationUpdater.AllCustomDrones.Add(this);
 
-                
+                bool needsNewID = false;
 
+                if (IsObjectNull(DroneDataBuffer))
+                {
+                    //need new entry
+                    DroneDataBuffer = new DroneBuffer
+                    {
+                        EntryID = Instance.StoredPermaData.AssignID(),
+                        RawData = new byte[256]
+                    };
+
+                    needsNewID = true;
+
+                    Instance.StoredPermaData.DroneData.Add(DroneDataBuffer.EntryID, DroneDataBuffer);
+                }
+
+                DroneDataBuffer.IsItem = false;
+
+                if (needsNewID)
+                {
+                    UpdateIdentifier(OnNewRCIdentifierAssign());
+                }
+
+                string fakePrefabName = StringPool.Get(FakePrefabID);
+
+                skinID = PreProcessedServer.PrefabNameToSkinID[fakePrefabName];
+
+                SetPrivateFieldValue(this, "_prefabName", PreProcessedServer.SkinIDToPrefabName[skinID]);
+
+                //disable native updates for performance
                 enabled = false;
+
+                DoServerInit();
+            }
+
+            public virtual void DoServerInit()
+            {
+
+            }
+
+            public virtual string OnNewRCIdentifierAssign()
+            {
+                return RandomRemoteControlIdentifier();
             }
 
             public override void OnPickedUpPreItemMove(Item createdItem, BasePlayer player)
             {
+                _wasJustPickedUp = true;
+
+                DroneDataBuffer.IsItem = true;
+
                 base.OnPickedUpPreItemMove(createdItem, player);
+                               
+
+                if (IsObjectNull(createdItem.instanceData))
+                {
+                    createdItem.instanceData = new ProtoBuf.Item.InstanceData();
+                    createdItem.instanceData.ShouldPool = false;
+                }
+
+                createdItem.instanceData.dataInt = DroneDataBuffer.EntryID;
 
                 SerializeDataToBuffer();
             }
@@ -498,29 +726,36 @@ namespace Oxide.Plugins
                 return;
             }
 
-            void OnDestroy()
+            public void OnEntityKill()
             {
-                DoDestroy();
+                DoOnEntityKill();
 
                 if (Unloading)
                 {
-                    SerializeDataToBuffer();
                     return;
                 }
 
-                RemoveData();
+                if (!_wasJustPickedUp)
+                {
+                    RemoveData();
+                }
 
-                if (IsObjectNull(AllCustomDrones))
+                if (IsObjectNull(SimulationUpdater.AllCustomDrones))
                 {
                     return;
                 }
 
-                if (!AllCustomDrones.Contains(this))
+                if (!SimulationUpdater.AllCustomDrones.Contains(this))
                 {
                     return;
                 }
 
-                AllCustomDrones.Remove(this);                
+                SimulationUpdater.AllCustomDrones.Remove(this);
+            }
+
+            public virtual void DoOnEntityKill()
+            {
+
             }
 
             //and instead respond to these
@@ -574,24 +809,53 @@ namespace Oxide.Plugins
                 return BodyUpdatesEnabled;
             }
 
-            public virtual void DoDestroy()
-            {
 
+            public void SerializeDataToBuffer()
+            {
+                using (var stream = new MemoryStream(256))
+                {
+                    using (var writer = new BinaryWriter(stream))
+                    {
+                        stream.Position = 0;
+                        writer.Write(FakePrefabID); //4
+                        writer.Write(OwnerID); //16
+                        writer.Write(healthFraction); //4
+                        writer.Write(transform.position.x); //4
+                        writer.Write(transform.position.y); //4
+                        writer.Write(transform.position.z); //4
+                        writer.Write(transform.eulerAngles.x); //4
+                        writer.Write(transform.eulerAngles.y); //4
+                        writer.Write(transform.eulerAngles.z); //4
+
+                        writer.Write(rcIdentifier.Substring(0, Mathf.Min(32, rcIdentifier.Length)));
+
+                        //jumping to pos 80 will effectively pad with 0s if the rcIdentifier is less than 32 characters
+                        stream.Position = HEADER_SIZE_BYTES;
+
+                        OnSaveExtra(stream, writer);
+
+                    }
+                    DroneDataBuffer.RawData = stream.ToArray();
+                    Instance.StoredPermaData.Dirty = true;
+                }
             }
 
-            private void SerializeDataToBuffer()
+            public virtual void OnSaveExtra(MemoryStream stream, BinaryWriter writer)
             {
-
+                //override this
             }
 
-            private void LoadDataFromBuffer()
+            public virtual void OnLoadExtra(MemoryStream stream, BinaryReader reader)
             {
-
+                //and this
             }
 
             private void RemoveData()
             {
+                var id = DroneDataBuffer.EntryID;
 
+                Instance.StoredPermaData.DroneData.Remove(id);
+                Instance.StoredPermaData.Dirty = true;
             }
 
 
@@ -688,7 +952,7 @@ namespace Oxide.Plugins
                         {
                             StoredMetaData.PluginsMissing.Add(entry);
                         }
-
+                        //Server.Command("Oxide.Load", pluginsNotFound.ToArray());
                         Server.Command("Oxide.Reload", pluginsNotFound.ToArray());
                         success = false;
                     }
@@ -725,7 +989,7 @@ namespace Oxide.Plugins
         {
             foreach (var plugin in StoredMetaData.PluginsSeen)
             {
-                plugin.Value.Plugin.IntegrityCheckFailure();
+                plugin.Value.Plugin?.IntegrityCheckFailure();
             }
         }
 
@@ -734,11 +998,159 @@ namespace Oxide.Plugins
             //continue loading the rest of the plugin
 
             SimulationGO = GetEmptyGameObject("DroneSimulation", Vector3.zero, Quaternion.identity);
-            SimulationMono = SimulationGO.AddComponent<Simulation>();
+            SimulationMono = SimulationGO.AddComponent<SimulationUpdater>();
+
+            DroneCustomBasic drone;
+
+            foreach (var entry in StoredPermaData.DroneData)
+            {
+                if (entry.Value.IsItem)
+                {
+                    continue;
+                }
+
+                drone = SummonWithData(entry.Value);
+
+                if (IsObjectNull(drone))
+                {
+                    continue;
+                }
+
+                drone.Spawn();
+            }
         }
         #endregion
         #region MISC HELPERS
         public static bool IsObjectNull(object obj) => ReferenceEquals(obj, null);
+
+        public static void SetPrivateFieldValue<T>(object obj, string propName, T val)
+        {
+            if (obj == null) throw new ArgumentNullException("obj");
+            Type t = obj.GetType();
+            System.Reflection.FieldInfo fi = null;
+            while (fi == null && t != null)
+            {
+                fi = t.GetField(propName, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                t = t.BaseType;
+            }
+            if (fi == null) throw new ArgumentOutOfRangeException("propName", string.Format("Field {0} was not found in Type {1}", propName, obj.GetType().FullName));
+            fi.SetValue(obj, val);
+        }
+
+        public static string RandomRemoteControlIdentifier(int length = 4)
+        {
+            StringBuilder builder = new StringBuilder(length);
+            string result;
+            do
+            {
+                builder.Clear();
+
+                for (var i = 0; i< length; i++)
+                {
+                    builder.Append((char)(65 + UnityEngine.Random.Range(0, 26)));
+                }
+
+                result = builder.ToString();
+            }
+            while (RemoteControlEntity.IDInUse(result));
+
+            return result;
+        }
+
+        public static DroneCustomBasic SummonWithData(int entryID, Vector3 overridePosition = default(Vector3), Vector3 overrideRotation = default(Vector3), ulong overrideOwnerID = default(ulong), bool makeCopyWithNewID = false)
+        {
+            if (!Instance.StoredPermaData.DroneData.ContainsKey(entryID))
+            {
+                return null;
+            }
+
+            return SummonWithData(Instance.StoredPermaData.DroneData[entryID], overridePosition, overrideRotation, overrideOwnerID, makeCopyWithNewID);
+        }
+
+        public static DroneCustomBasic SummonWithData(DroneBuffer workingEntry, Vector3 overridePosition = default(Vector3), Vector3 overrideRotation = default(Vector3), ulong overrideOwnerID = default(ulong), bool makeCopyWithNewID = false)
+        {
+            var deserialized = new DroneDataBasic();
+
+            using (var stream = new MemoryStream(workingEntry.RawData))
+            {
+                using (var reader = new BinaryReader(stream))
+                {
+                    deserialized.FakePrefabID = reader.ReadUInt32(); //4
+                    deserialized.OwnerID = reader.ReadUInt64(); //16
+                    deserialized.HealthFraction = reader.ReadSingle(); //4
+                    deserialized.Position = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle()); //12
+                    deserialized.Rotation = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle()); //12
+
+                    char currentChar;
+                    long savePosition = stream.Position;
+
+                    int foundLength = 0;
+
+                    while (stream.Position < HEADER_SIZE_BYTES)
+                    {
+                        currentChar = reader.ReadChar();
+                        if (currentChar == 0)
+                        {
+                            break;
+                        }
+
+                        foundLength++;
+                    }
+
+                    //back...
+                    stream.Position = savePosition;
+                    deserialized.RemoteID = new string(reader.ReadChars(foundLength));
+                }
+            }
+
+            if (overridePosition != default(Vector3))
+            {
+                deserialized.Position = overridePosition;
+            }
+
+            if (overrideRotation != default(Vector3))
+            {
+                deserialized.Rotation = overrideRotation;
+            }
+
+            if (overrideOwnerID != default(ulong))
+            {
+                deserialized.OwnerID = overrideOwnerID;
+            }
+
+            if (makeCopyWithNewID)
+            {
+                workingEntry = workingEntry.CopyWithNewID();
+                Instance.StoredPermaData.DroneData.Add(workingEntry.EntryID, workingEntry);
+                Instance.StoredPermaData.Dirty = true;
+            }
+
+            var prefabName = StringPool.Get(deserialized.FakePrefabID);
+
+            if (prefabName == string.Empty)
+            {
+                Instance.PrintWarning(MSG(MSG_ERROR_DESERIALIZING_PREFAB_NOT_FOUND, null, deserialized.FakePrefabID));
+                return null;
+            }
+
+            var newDrone = GameManager.server.CreateEntity(prefabName, deserialized.Position, Quaternion.Euler(deserialized.Rotation)) as DroneCustomBasic;
+
+            if (IsObjectNull(newDrone))
+            {
+                Instance.PrintWarning(MSG(MSG_ERROR_DESERIALIZING_ENTITY_NULL));
+                return null;
+            }
+
+            newDrone.OwnerID = deserialized.OwnerID;
+            newDrone.SetHealth(deserialized.HealthFraction * newDrone._maxHealth);
+            newDrone.rcIdentifier = deserialized.RemoteID;
+
+            newDrone.SummonedFromData(workingEntry);
+            //ready to spawn now
+
+            return newDrone;
+        }
+
         public static GameObject GetEmptyGameObject(string name, Vector3 position, Quaternion rotation = default(Quaternion))
         {
             if (rotation == default(Quaternion))
@@ -758,15 +1170,50 @@ namespace Oxide.Plugins
         #endregion
         #region PERMA DATA
 
-        public class CustomDroneData
+        public struct DroneDataBasic
+        {
+            public uint FakePrefabID;
+            public ulong OwnerID;
+            public float HealthFraction;
+            public Vector3 Position;
+            public Vector3 Rotation;
+            public string RemoteID;
+        }
+
+        public class DroneBuffer
         {
             public int EntryID;
             public byte[] RawData;
+            public bool IsItem = false;
+
+            public DroneBuffer CopyWithNewID(int newID = default(int))
+            {
+                if (newID == default(int))
+                {
+                    newID = Instance.StoredPermaData.AssignID();
+                }
+
+                return new DroneBuffer
+                {
+                    EntryID = newID,
+                    RawData = RawData.ToArray(),
+                    IsItem = IsItem
+                };
+            }
         }
 
         public class PermaData
         {
-            public Hash<int, CustomDroneData> DroneData = new Hash<int, CustomDroneData>();
+            public Hash<int, DroneBuffer> DroneData = new Hash<int, DroneBuffer>();
+
+            public int LastDataID = 0;
+
+            public int AssignID()
+            {
+                LastDataID++;
+                Dirty = true;
+                return LastDataID - 1;
+            }
 
             [JsonIgnore]
             public bool Dirty = true;
@@ -795,6 +1242,11 @@ namespace Oxide.Plugins
         {
             PrintWarning(MSG(MSG_PERMADATA_SAVING));
 
+            for (var i = 0; i<SimulationUpdater.AllCustomDrones.Count; i++)
+            {
+                SimulationUpdater.AllCustomDrones[i].SerializeDataToBuffer();
+            }
+
             Interface.Oxide.DataFileSystem.WriteObject(Name + ".PERMADATA", StoredPermaData);
         }
         public void NewPermaData()
@@ -803,7 +1255,6 @@ namespace Oxide.Plugins
             SavePermaData();
         }
         #endregion
-
         #region META DATA
         public class SubPluginEntry
         {

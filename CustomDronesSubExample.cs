@@ -1,14 +1,13 @@
 // Requires: CustomDrones
 
-using Oxide.Core;
-using System;
-using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using UnityEngine;
 using static Oxide.Plugins.CustomDrones;
 
 namespace Oxide.Plugins
 {
-    [Info("CustomDronesSubExample", "Nikedemos", "1.0.0")]
+    [Info("CustomDronesSubExample", "Nikedemos", "1.0.1")]
     [Description("This plugin contains everything you need to register, spawn and use your custom Drone types")]
     public class CustomDronesSubExample : CustomDronesPlugin
     {
@@ -17,7 +16,12 @@ namespace Oxide.Plugins
         //- must start with assets/custom_drones/
         //- must NOT contain any characters apart from letters, numbers, dashes, periods, underscores, forward slashes.
 
-        public const string PREFAB_EXAMPLE = PREFAB_MANDATORY_PREFIX + "nikedemos/drone.example.prefab";
+        //of course you don't have to define the constants at all, it's just to make things easier
+        public const string PREFAB_SHORTNAME = "drone.example";
+        public const string PREFAB_EXAMPLE = PREFAB_MANDATORY_PREFIX + "nikedemos/" + PREFAB_SHORTNAME +".prefab";
+
+        public const ulong SKINID_EXAMPLE = 2436737889;
+
         private static CustomDronesSubExample SubInstance;
 
         public class DroneCustomExample : DroneCustomBasic
@@ -30,10 +34,20 @@ namespace Oxide.Plugins
 
             private static float PROGRESS_WRAP = 4F * Mathf.PI;
 
-            public override void ServerInit()
+            public override void OnSaveExtra(MemoryStream stream, BinaryWriter writer)
             {
-                base.ServerInit();
+                writer.Write(_goingForward);
+                writer.Write(_progress);
+            }
 
+            public override void OnLoadExtra(MemoryStream stream, BinaryReader reader)
+            {
+                _goingForward = reader.ReadBoolean();
+                _progress = reader.ReadSingle();
+            }
+
+            public override void DoServerInit()
+            {
                 _posOffsetLocal = Vector3.zero;
 
                 //turn off gravity and all the extra stuff
@@ -44,8 +58,7 @@ namespace Oxide.Plugins
                 altitudeAcceleration = 0F;
                 keepAboveTerrain = false;
 
-                SubInstance.PrintWarning($"My name is {PrefabName}, but everybody calls me {ShortPrefabName}. My unique prefab ID is {prefabID} and I'm of type {GetType()}\nI'm going to fly around in a circle, changing direction on every brain update, and then kill myself after 10 seconds.");
-
+                SubInstance.PrintWarning($"My name is {PrefabName}, my skin is {skinID} but everybody calls me {ShortPrefabName}. My unique prefab ID is {prefabID} and I'm of type {GetType()}\nI'm going to fly around in a circle, changing direction on every brain update.\nMy data id is {DroneDataBuffer.EntryID}!\nAnd my RC ID is {rcIdentifier}");
             }
 
             public override void DoBrainUpdate()
@@ -74,6 +87,10 @@ namespace Oxide.Plugins
                 transform.position = SpawnPosition + _posOffsetLocal;
                 transform.eulerAngles = new Vector3(transform.eulerAngles.x, (_progress / PROGRESS_WRAP) * 360F, transform.eulerAngles.z);
                 transform.hasChanged = true;
+
+                var firstPlayer = BasePlayer.activePlayerList.FirstOrDefault();
+
+                firstPlayer?.SendConsoleCommand("ddraw.text", Time.fixedDeltaTime, Color.red, transform.position, DroneDataBuffer.EntryID);
             }
         }
 
@@ -82,23 +99,21 @@ namespace Oxide.Plugins
         {
             base.IntegrityCheckSuccess();
 
-            SubInstance.PrintWarning($"\n{Name} is ready! Spawning a test drone at 0,0,0...\n");
+            //SubInstance.PrintWarning($"\n{Name} is ready! Spawning a test drone at 0,0,0...\n");
 
-            var testDrone = GameManager.server.CreateEntity(PREFAB_EXAMPLE, Vector3.zero, Quaternion.identity);
-            testDrone.Spawn();
+            //var testDrone = GameManager.server.CreateEntity(PREFAB_EXAMPLE, Vector3.zero, Quaternion.identity);
+            //testDrone.Spawn();
         }
 
         public override void OnPluginPreProcessedRegistration()
         {
-            PreProcessedServer.RegisterDronePrefab<DroneCustomExample>(PREFAB_EXAMPLE);
+            PreProcessedServer.RegisterDronePrefab<DroneCustomExample>(PREFAB_EXAMPLE, SKINID_EXAMPLE);
         }
 
         public override void OnPluginPreProcessedUnregistration()
         {
             PreProcessedServer.UnregisterDronePrefab(PREFAB_EXAMPLE);
         }
-
-
         #endregion
 
         #region LEAVE THESE ALONE UNLESS YOU KNOW WHAT YOU'RE DOING
