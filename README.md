@@ -8,7 +8,7 @@ Custom Drones does all the heavy lifting associated with that seemingly impossib
 
 After unloading, everything goes back to normal. Custom Drone entities are serialised, stored in the plugin datafile and killed - to avoid Null reference errors for no-longer-existing Types. They can be restored later on plugin reload.  Any changes made to the GameManager/GameManifest are reverted.
 
-NOTE: This plugin utilises Reflection in 1 or 2 places in order to force the BaseEntity._prefabName field to its custom, registered prefab name, instead of the prefab name of the original entity it was based on. This field is private and changing its accessor to public leads to less than stellar results, according to WhiteThunder's experiments with patching Oxide. In my opinion there is no point in turning the entire plugin into a compiled extension for the sole purpose of addressing the BaseEntity._prefabName field.
+NOTE: This plugin utilises Reflection in 1 or 2 places in order to force the BaseEntity._prefabName field to its custom, registered prefab name, instead of the prefab name of the original entity it was based on. This field is private and changing its accessor to public leads to less than stellar results, according to WhiteThunder's experiments with patching Oxide. In my opinion there is no point in turning the entire plugin into a compiled extension for the sole purpose of addressing the BaseEntity._prefabName field. **AS FAR AS REFLECTION GOES, THIS DOES NOT REQUIRE SANDBOXING TO BE TURNED OFF - IT USES IT SPARINGLY AS MUCH AS OXIDE PERMITS IT.**
 
 ## Functionality handled internally
 
